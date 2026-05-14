@@ -19,15 +19,27 @@ from .ckp_decoder import (
     compute_magic,
     decode_ckp,
 )
+from .hardware import (
+    CATALOG,
+    HardwareConfig,
+    SlotInfo,
+    describe_hardware,
+    lookup_module,
+)
 
 __all__ = [
+    "CATALOG",
     "CkpProject",
+    "HardwareConfig",
     "Instruction",
     "NickEntry",
     "Rung",
+    "SlotInfo",
     "Subroutine",
     "compute_magic",
     "decode_ckp",
+    "describe_hardware",
+    "lookup_module",
 ]
 
 __version__ = "0.1.0"

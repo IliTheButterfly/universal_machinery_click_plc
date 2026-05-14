@@ -67,12 +67,29 @@ def u32(data: bytes, off: int) -> int:
 # --- ladder logic decoding -------------------------------------------------
 
 LADDER_OPCODES = {
-    0x11: "ContactNO", 0x12: "ContactNC", 0x15: "Out",
-    0x23: "Call", 0x24: "Return", 0x27: "End",
+    0x11: "ContactNO", 0x12: "ContactNC",
+    0x13: "Edge",
+    0x14: "Compare",
+    0x15: "Out", 0x16: "Out", 0x17: "Out",
+    0x18: "Tmr",
+    0x1a: "Math",
+    0x21: "Copy",
+    0x23: "Call", 0x24: "Return",
+    0x25: "For", 0x26: "Next",
+    0x27: "End",
 }
-TAGGED_OPCODES = {0x11, 0x12, 0x15}
+# Opcodes that carry a single "primary" memory tag near op_off+16
+# (length-prefixed UTF-16LE pstr).  Compare/Math/Copy carry multiple
+# operands so we render them via dedicated extractors below.
+# Note: the exact offset varies slightly by opcode (e.g. Tmr 0x18 sits
+# at +18 due to extra preamble bytes), so the scanner does a tolerant
+# forward search rather than reading at a fixed offset.
+TAGGED_OPCODES = {0x11, 0x12, 0x13, 0x15, 0x16, 0x17, 0x18, 0x25}
 RUNG_END = re.compile(rb'\x20\x00(?:\x01[\x00-\x1f]){32}')
-_OPCODE_NAME_LENS = {0x07, 0x09, 0x0d, 0x13}
+# Permitted pstr length-prefix bytes for the instruction NAME pstr:
+# 0x07 "Out"/"End"/"Tmr"/"For", 0x09 "Call"/"Edge"/"Math"/"Copy"/"Next",
+# 0x0d "Return", 0x0f "Compare", 0x13 "ContactNO"/"ContactNC".
+_OPCODE_NAME_LENS = {0x07, 0x09, 0x0d, 0x0f, 0x13}
 
 
 @dataclass
@@ -81,6 +98,10 @@ class Instruction:
     opcode: int
     name: str
     tag: Optional[str] = None
+    # Extra operands for multi-operand ops (Copy: [src,dst]; Compare: [lhs,rhs];
+    # Math: [dst,lhs,rhs] or similar).  Always includes `tag` as operands[0]
+    # when populated, for uniform consumption.
+    operands: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -308,6 +329,42 @@ def _read_pstr_utf16le(data: bytes, off: int) -> str:
     return data[off+1:off+n].decode('utf-16-le', errors='replace').rstrip('\x00')
 
 
+def _try_read_pstr_at(data: bytes, off: int, hi: int,
+                       allowed_lens: range = range(3, 0x41)) -> Optional[tuple[str, int]]:
+    """Try reading a length-prefixed UTF-16LE pstr at `off`.
+
+    Returns ``(string, ln)`` where ``ln`` is the length-prefix byte (= total
+    bytes consumed including the length byte itself).  Returns None if the
+    bytes at `off` don't look like a valid CLICK pstr.
+
+    CLICK pstrs are: ``[ln] [ln-1 bytes of content]`` where content is
+    UTF-16LE.  ``ln`` is always odd (=2*chars+1) for non-empty strings.
+    """
+    if off >= hi:
+        return None
+    ln = data[off]
+    if ln not in allowed_lens or ln % 2 == 0:
+        return None
+    if off + ln > hi:
+        return None
+    try:
+        s = data[off+1:off+ln].decode('utf-16-le').rstrip('\x00')
+    except Exception:
+        return None
+    if not s or not s.isprintable():
+        return None
+    return s, ln
+
+
+# Which opcodes carry extra operand pstrs after the primary tag.
+# Values are the maximum number of pstr operands to try and read (incl. primary).
+_MULTI_OPERAND_OPCODES = {
+    0x21: 2,   # Copy: src, dst
+    0x14: 2,   # Compare: lhs, rhs
+    0x1a: 3,   # Math: dst, lhs, rhs (best-effort)
+}
+
+
 def _scan_instructions(data: bytes, lo: int, hi: int) -> list[Instruction]:
     out: list[Instruction] = []
     p = lo
@@ -323,31 +380,62 @@ def _scan_instructions(data: bytes, lo: int, hi: int) -> list[Instruction]:
             p += 1; continue
         op_off = p + ln + 1
         op = data[op_off]
+        # The pstr name is a display label only -- the opcode determines
+        # semantics.  CLICK reuses the same pstr name across related
+        # opcodes (e.g. "ContactNO" pstr precedes both 0x11 NO and 0x12
+        # NC; "Out" precedes 0x15 coil, 0x16 set, 0x17 reset).  So we
+        # accept any (name, opcode) pair as long as opcode is known.
         if op not in LADDER_OPCODES:
             p += 1; continue
-        tag = None
+        tag: Optional[str] = None
+        operands: list[str] = []
+        next_p = op_off + 1
         if op in TAGGED_OPCODES:
-            tag_len_off = op_off + 16
-            if tag_len_off < hi:
-                tlen = data[tag_len_off]
-                if tlen and tag_len_off + tlen < hi:
-                    try:
-                        tag = (data[tag_len_off+1:tag_len_off+tlen]
-                               .decode('utf-16-le').rstrip('\x00'))
-                    except Exception:
-                        pass
+            # Primary tag pstr usually sits at op_off+16, but Tmr/some
+            # variants have extra preamble (+18).  Probe a small window.
+            for skip in (0, 2, 1, 3, 4):
+                res = _try_read_pstr_at(data, op_off + 16 + skip, hi)
+                if res is not None:
+                    tag, tlen = res
+                    operands.append(tag)
+                    next_p = op_off + 16 + skip + tlen
+                    break
+        elif op in _MULTI_OPERAND_OPCODES:
+            # First operand at op_off + 16, subsequent operands follow,
+            # each preceded by a 2-byte address-type word.
+            cur = op_off + 16
+            wanted = _MULTI_OPERAND_OPCODES[op]
+            for _ in range(wanted):
+                # Skip up to 4 bytes of inter-operand padding (we know there's
+                # a 2-byte type word, but be lenient).
+                found = None
+                for skip in range(0, 6):
+                    res = _try_read_pstr_at(data, cur + skip, hi)
+                    if res is not None:
+                        found = (res, cur + skip)
+                        break
+                if found is None:
+                    break
+                (s, slen), s_off = found
+                operands.append(s)
+                if tag is None:
+                    tag = s
+                cur = s_off + slen
+                next_p = cur
         elif op == 0x23:
-            for q in range(op_off + 17, min(op_off + 60, hi)):
-                tl = data[q]
-                if tl in (9, 0x0d, 0x13, 0x19, 0x21, 0x29):
-                    try:
-                        t = data[q+1:q+tl].decode('utf-16-le').rstrip('\x00')
-                        if t and t.isprintable():
-                            tag = t; break
-                    except Exception:
-                        pass
-        out.append(Instruction(p, op, LADDER_OPCODES[op], tag))
-        p = op_off + 1
+            # Call target name pstr: prefix N where N = utf16_bytes + 1, so N is odd
+            # and N <= ~40 (subroutine names are short).  Walk forward until we
+            # find a length byte that decodes as a printable UTF-16LE string.
+            for q in range(op_off + 17, min(op_off + 80, hi)):
+                res = _try_read_pstr_at(data, q, hi)
+                if res is None:
+                    continue
+                tag = res[0]
+                operands.append(tag)
+                next_p = q + res[1]
+                break
+        out.append(Instruction(p, op, LADDER_OPCODES[op], tag, operands))
+        p = max(next_p, op_off + 1)
     return out
 
 
@@ -367,12 +455,47 @@ def parse_subroutine(data: bytes, off: int, size: int) -> Subroutine:
 def render_rung(instrs: list[Instruction]) -> str:
     contacts, outputs = [], []
     for ins in instrs:
-        if ins.opcode == 0x11:    contacts.append(ins.tag)
-        elif ins.opcode == 0x12:  contacts.append(f"NOT {ins.tag}")
-        elif ins.opcode == 0x15:  outputs.append(f"COIL({ins.tag})")
-        elif ins.opcode == 0x23:  outputs.append(f"CALL {ins.tag}")
-        elif ins.opcode == 0x24:  outputs.append("RETURN")
-        elif ins.opcode == 0x27:  outputs.append("END")
+        op = ins.opcode
+        ops_str = ins.operands or ([ins.tag] if ins.tag else [])
+        if op == 0x11:
+            contacts.append(ins.tag or "?")
+        elif op == 0x12:
+            contacts.append(f"NOT {ins.tag or '?'}")
+        elif op == 0x13:
+            contacts.append(f"|EDGE| {ins.tag or '?'}")
+        elif op == 0x14:
+            if len(ops_str) >= 2:
+                contacts.append(f"CMP({ops_str[0]} ? {ops_str[1]})")
+            else:
+                contacts.append(f"CMP({', '.join(ops_str) or '?'})")
+        elif op == 0x15:
+            outputs.append(f"COIL({ins.tag or '?'})")
+        elif op == 0x16:
+            outputs.append(f"SET({ins.tag or '?'})")
+        elif op == 0x17:
+            outputs.append(f"RESET({ins.tag or '?'})")
+        elif op == 0x18:
+            outputs.append(f"TMR({ins.tag or '?'})")
+        elif op == 0x1a:
+            if ops_str:
+                outputs.append(f"MATH({', '.join(ops_str)})")
+            else:
+                outputs.append("MATH(?)")
+        elif op == 0x21:
+            if len(ops_str) >= 2:
+                outputs.append(f"COPY({ops_str[0]} -> {ops_str[1]})")
+            else:
+                outputs.append(f"COPY({', '.join(ops_str) or '?'})")
+        elif op == 0x23:
+            outputs.append(f"CALL {ins.tag or '?'}")
+        elif op == 0x24:
+            outputs.append("RETURN")
+        elif op == 0x25:
+            outputs.append(f"FOR({ins.tag or '?'})")
+        elif op == 0x26:
+            outputs.append("NEXT")
+        elif op == 0x27:
+            outputs.append("END")
     lhs = " AND ".join(c for c in contacts if c)
     rhs = " ; ".join(outputs)
     if lhs and rhs:  return f"{lhs}  ->  {rhs}"
