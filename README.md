@@ -4,7 +4,7 @@ Read and write AutomationDirect [CLICK PLC](https://www.automationdirect.com/cli
 
 CLICK Programming Software stores projects in an undocumented binary container.  This package decodes that container and re-encodes it byte-for-byte, including the file's XOR-16 integrity checksum and the SC-NICK / SC-SCR section bookkeeping that EB Pro updates per save.  Edited files load cleanly in CLICK Programming Software v3.43.
 
-This package is consumed as a git submodule by the [universal_machinery](https://github.com/iliana/universal_machinery) project but works fine standalone.
+This package is consumed as a git submodule by the [universal_machinery](https://github.com/IliTheButterfly/universal_machinery) project but works fine standalone.
 
 ## Status
 
@@ -78,4 +78,9 @@ The file's container layout, magic algorithm, and rung-byte encodings are docume
 
 ## License
 
-GPL-3.0-or-later, same as the parent `universal_machinery` project.
+AGPL-3.0-or-later, same as the parent `universal_machinery` project.
+See [`LICENSE`](LICENSE) for the full text.
+
+Contributions require a `Signed-off-by` line per the
+[Developer Certificate of Origin](https://developercertificate.org/),
+matching the parent project's contribution model.

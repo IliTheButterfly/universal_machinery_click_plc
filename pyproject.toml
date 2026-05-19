@@ -7,7 +7,7 @@ name = "click_plc"
 version = "0.1.0"
 description = "Read and write AutomationDirect CLICK PLC project files (.ckp)"
 readme = "README.md"
-license = { text = "GPL-3.0-or-later" }
+license = { text = "AGPL-3.0-or-later" }
 requires-python = ">=3.10"
 authors = [
     { name = "iliana" },
@@ -15,7 +15,7 @@ authors = [
 keywords = ["plc", "automationdirect", "click", "ckp", "ladder-logic"]
 classifiers = [
     "Development Status :: 3 - Alpha",
-    "License :: OSI Approved :: GNU General Public License v3 or later (GPLv3+)",
+    "License :: OSI Approved :: GNU Affero General Public License v3 or later (AGPLv3+)",
     "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
     "Topic :: Scientific/Engineering",
