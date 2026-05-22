@@ -8,6 +8,8 @@ This package is consumed as a git submodule by the [universal_machinery](https:/
 
 ## Status
 
+### Low-level CKP I/O (vendor-native ``CkpProject`` AST)
+
 | Capability | State |
 |---|---|
 | Read both container variants (older `vPt` magic, newer 4-byte hash magic) | ✅ |
@@ -18,6 +20,18 @@ This package is consumed as a git submodule by the [universal_machinery](https:/
 | Build a rung from instruction primitives without a template | ❌ (uses verbatim templates extracted from real EB Pro output) |
 | Cold-build SC-SCR for a brand-new subroutine | ❌ (clone an existing one instead) |
 | Tag-length flexibility | partial — each `Rung.<helper>` requires specific tag lengths matching its template |
+
+### Backend ABC integration (universal_machinery)
+
+| Capability | State |
+|---|---|
+| ``ClickBackend(Backend)`` registered as ``"click"`` | ✅ (scaffold landed; advertises capability set) |
+| ``ClickBackend.write(program, "*.ckp")`` | ❌ (scaffold; raises ``NotImplementedError``) -- needs the encoder + ``CkpProject`` ↔ IL Program bridge |
+| ``ClickBackend.read("*.ckp") -> Program`` | ❌ (scaffold; raises ``NotImplementedError``) -- needs the ``CkpProject`` → IL Program bridge |
+| Capabilities advertised | ``ld`` / ``timers`` / ``counters`` / ``compare`` / ``math`` / ``call`` / ``function_blocks`` / ``jump`` / ``parallel`` / ``data_blocks`` (covered by ``universal_machinery.lowering.click_calling``) |
+| Not advertised | ``sfc`` / ``st`` / ``functions`` / ``methods`` / ``interfaces`` / ``extends`` / ``implements`` / ``abstract`` (CLICK has no equivalents) |
+
+The Backend ABC integration is tracked under the parent project's roadmap item *"Settle the IL ↔ CLICK lowering so Program can round-trip through .ckp"*.  The scaffold here is step 1; the encoder + bridge are the pending follow-ups.
 
 ## Install
 

@@ -20,7 +20,19 @@ classifiers = [
     "Programming Language :: Python :: 3",
     "Topic :: Scientific/Engineering",
 ]
-dependencies = []
+# ``universal_machinery`` is the parent vendor-neutral IL project that
+# owns the IL → CLICK lowering this backend's ``write()`` will
+# eventually dispatch to.  Not on PyPI yet; consume via the parent
+# repo's submodule layout, or pip-install from the parent's git URL
+# alongside this package.
+dependencies = [
+    "universal_machinery",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8",
+]
 
 [project.scripts]
 ckp-extract = "click_plc.extract_ckp:main"
