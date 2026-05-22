@@ -147,3 +147,78 @@ def test_ladder_opcode_table_covers_basic_ops():
     assert LADDER_OPCODES.get(0x23) == "Call"
     assert LADDER_OPCODES.get(0x24) == "Return"
     assert LADDER_OPCODES.get(0x27) == "End"
+
+
+# -----------------------------------------------------------------------------
+# Backend ABC integration (scaffold)
+# -----------------------------------------------------------------------------
+
+
+def test_click_backend_imports_cleanly():
+    """The Backend ABC scaffold imports without errors.  Also pins
+    that ``ClickBackend`` is re-exported from the package top
+    level (via __init__.__all__)."""
+    import click_plc
+    assert "ClickBackend" in click_plc.__all__
+    assert hasattr(click_plc, "ClickBackend")
+
+
+def test_click_backend_registered_in_universal_machinery():
+    """``@register('click')`` makes the backend discoverable via
+    ``get_backend('click')`` after the package is imported."""
+    import click_plc  # noqa: F401  (side-effect: registers)
+    from universal_machinery.backends import (
+        get_backend, registered_names,
+    )
+    assert "click" in registered_names()
+    backend = get_backend("click")
+    assert backend.__class__.__name__ == "ClickBackend"
+
+
+def test_click_backend_advertises_expected_capabilities():
+    """Capabilities the IL → CLICK lowering already supports
+    (``universal_machinery.lowering.click_calling``).  Not in the
+    set: ``sfc`` / ``st`` / ``functions`` / ``methods`` etc.,
+    since CLICK doesn't model those."""
+    from click_plc import ClickBackend
+    expected_present = {
+        "ld", "timers", "counters", "compare", "math", "call",
+        "function_blocks", "jump", "parallel", "data_blocks",
+    }
+    expected_absent = {"sfc", "st", "functions", "methods",
+                          "interfaces", "extends", "implements",
+                          "abstract"}
+    for cap in expected_present:
+        assert cap in ClickBackend.capabilities, (
+            f"ClickBackend should advertise {cap!r} -- the IL → CLICK "
+            f"lowering covers it via click_calling.py"
+        )
+    for cap in expected_absent:
+        assert cap not in ClickBackend.capabilities, (
+            f"ClickBackend must not advertise {cap!r} -- CLICK has "
+            f"no equivalent construct"
+        )
+
+
+def test_click_backend_write_raises_not_implemented_with_pointer(tmp_path):
+    """Scaffold contract: ``write()`` raises ``NotImplementedError``
+    with a message pointing at the encoder roadmap item so future
+    callers aren't left guessing why it doesn't work yet."""
+    from click_plc import ClickBackend
+    from universal_machinery.builders import prog, program
+    out = tmp_path / "prog.ckp"
+    p = program(subroutines=[prog("Main", main=True)])
+    with pytest.raises(NotImplementedError, match="encoder"):
+        ClickBackend().write(p, str(out))
+
+
+def test_click_backend_read_raises_not_implemented_with_pointer(tmp_path):
+    """Scaffold contract: ``read()`` raises ``NotImplementedError``
+    pointing at the CkpProject→IL bridge roadmap item.  Users who
+    want byte-level CKP introspection should use ``decode_ckp`` as
+    the error message suggests."""
+    from click_plc import ClickBackend
+    out = tmp_path / "prog.ckp"
+    out.write_bytes(b"")
+    with pytest.raises(NotImplementedError, match="CkpProject"):
+        ClickBackend().read(str(out))
