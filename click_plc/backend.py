@@ -101,17 +101,25 @@ class ClickBackend(Backend):
     def read(self, path: str) -> Program:
         """Decode a ``.ckp`` file and return an IL ``Program``.
 
-        SCAFFOLD: not yet implemented.  ``decode_ckp`` already
-        parses the bytes into a vendor-specific ``CkpProject`` AST,
-        but there's no ``CkpProject`` → ``universal_machinery.il.
-        Program`` adapter yet.  Pending the same roadmap item as
-        ``write()``.
+        Reads the bytes via ``decode_ckp`` (vendor-native AST) then
+        translates to the IL via
+        :func:`click_plc.ckp_to_il.ckp_to_il`.
+
+        Op coverage in this first slice: the simple LD ops with
+        direct IL analogues -- ContactNO / ContactNC, OutCoil /
+        OutSet / OutReset, Copy (-> Move), Call / Return / End.
+        Multi-operand ops (Compare / Math / Tmr / Edge / For-Next)
+        are skipped from rungs silently; the surrounding contacts
+        and coils still survive so the program structure is
+        usable for inspection / diff workflows.  Future slices
+        will fill in the gaps.
+
+        For byte-level CKP introspection without IL translation,
+        use ``click_plc.decode_ckp(bytes)`` directly.
         """
-        raise NotImplementedError(
-            "ClickBackend.read: CkpProject → IL Program bridge not "
-            "yet implemented.  ``click_plc.decode_ckp(bytes)`` parses "
-            ".ckp into the vendor-native ``CkpProject`` AST (use it "
-            "directly if you need byte-level CKP introspection); the "
-            "IL conversion is a pending roadmap item.  Track in "
-            "``docs/ROADMAP.md``."
-        )
+        from .ckp_decoder import decode_ckp
+        from .ckp_to_il import ckp_to_il
+
+        with open(path, "rb") as f:
+            data = f.read()
+        return ckp_to_il(decode_ckp(data))

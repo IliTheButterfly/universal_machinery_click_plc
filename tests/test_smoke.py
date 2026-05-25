@@ -212,13 +212,263 @@ def test_click_backend_write_raises_not_implemented_with_pointer(tmp_path):
         ClickBackend().write(p, str(out))
 
 
-def test_click_backend_read_raises_not_implemented_with_pointer(tmp_path):
-    """Scaffold contract: ``read()`` raises ``NotImplementedError``
-    pointing at the CkpProject→IL bridge roadmap item.  Users who
-    want byte-level CKP introspection should use ``decode_ckp`` as
-    the error message suggests."""
+def test_click_backend_read_dispatches_through_ckp_to_il(tmp_path):
+    """``ClickBackend.read`` decodes the bytes via ``decode_ckp``
+    and translates via ``ckp_to_il``.  This test mocks both halves
+    at their source modules (the backend imports them lazily, so
+    we patch the underlying names) -- the byte-level decoder
+    integration is already covered by the decoder's own tests;
+    here we pin the backend's plumbing."""
+    from unittest.mock import patch
+
     from click_plc import ClickBackend
+    from universal_machinery.builders import prog, program
+
     out = tmp_path / "prog.ckp"
-    out.write_bytes(b"")
-    with pytest.raises(NotImplementedError, match="CkpProject"):
-        ClickBackend().read(str(out))
+    out.write_bytes(b"any-bytes")
+    expected = program(subroutines=[prog("Main", main=True)])
+    with patch("click_plc.ckp_decoder.decode_ckp",
+                 return_value="CkpProject-sentinel"), \
+         patch("click_plc.ckp_to_il.ckp_to_il",
+                 return_value=expected) as adapter:
+        result = ClickBackend().read(str(out))
+    adapter.assert_called_once_with("CkpProject-sentinel")
+    assert result is expected
+
+
+# -----------------------------------------------------------------------------
+# CkpProject -> IL Program adapter
+# -----------------------------------------------------------------------------
+
+
+def test_ckp_to_il_empty_project_returns_empty_program():
+    """A ``CkpProject`` with no subroutines / nicknames translates
+    to a ``Program`` with no subroutines / tags.  Sanity check on
+    the adapter's defaults."""
+    from click_plc.ckp_decoder import CkpProject
+    from click_plc.ckp_to_il import ckp_to_il
+
+    proj = CkpProject(
+        variant="B", magic=b"\0\0\0\0", section_marker=0x0350,
+        prj_raw=b"", ini_raw=b"", nick_raw=b"", dview_raw=b"",
+        cmore_raw=b"", scr_raw=[], raw_zip_blobs=[],
+    )
+    program = ckp_to_il(proj)
+    assert program.subroutines == []
+    assert program.tags == {}
+
+
+def test_ckp_to_il_translates_nicknames_to_tags():
+    """``CkpProject.nicknames`` -> ``Program.tags``, keyed by
+    nickname when set, falling back to raw address otherwise."""
+    from click_plc.ckp_decoder import CkpProject, NickEntry
+    from click_plc.ckp_to_il import ckp_to_il
+    from universal_machinery.il import TagType
+
+    proj = CkpProject(
+        variant="B", magic=b"\0\0\0\0", section_marker=0x0350,
+        prj_raw=b"", ini_raw=b"", nick_raw=b"", dview_raw=b"",
+        cmore_raw=b"", scr_raw=[], raw_zip_blobs=[],
+        nicknames=[
+            NickEntry(address="X001", nickname="estop", default="E-stop"),
+            NickEntry(address="Y001", nickname="lamp", default=""),
+            NickEntry(address="DS20", nickname="", default=""),
+        ],
+    )
+    program = ckp_to_il(proj)
+    # Keys: nickname if present, raw address otherwise.
+    assert set(program.tags) == {"estop", "lamp", "DS20"}
+    # Data-type inference from prefix.
+    assert program.tags["estop"].data_type is TagType.BOOL
+    assert program.tags["lamp"].data_type is TagType.BOOL
+    assert program.tags["DS20"].data_type is TagType.INT
+    # Description from the default field.
+    assert program.tags["estop"].description == "E-stop"
+    # Address preserved verbatim.
+    assert program.tags["lamp"].address.raw == "Y001"
+
+
+def test_ckp_to_il_duplicate_nicknames_get_suffixed():
+    """Two unnamed nicknames at different addresses would both
+    map to ``""`` -- the adapter falls back to the raw address as
+    the key, so they don't collide.  Verify."""
+    from click_plc.ckp_decoder import CkpProject, NickEntry
+    from click_plc.ckp_to_il import ckp_to_il
+
+    proj = CkpProject(
+        variant="B", magic=b"\0\0\0\0", section_marker=0x0350,
+        prj_raw=b"", ini_raw=b"", nick_raw=b"", dview_raw=b"",
+        cmore_raw=b"", scr_raw=[], raw_zip_blobs=[],
+        nicknames=[
+            NickEntry(address="X001"),
+            NickEntry(address="X002"),
+        ],
+    )
+    program = ckp_to_il(proj)
+    assert set(program.tags) == {"X001", "X002"}
+
+
+def test_ckp_to_il_translates_subroutines_with_main_flag():
+    """The first ``CkpProject.subroutines`` entry maps to
+    ``main=True``; all others get ``main=False``.  All map to
+    ``PouKind.PROGRAM`` since CLICK doesn't distinguish IEC
+    FUNCTION / FUNCTION_BLOCK."""
+    from click_plc.ckp_decoder import (
+        CkpProject, Subroutine as CkpSub,
+    )
+    from click_plc.ckp_to_il import ckp_to_il
+    from universal_machinery.il import PouKind
+
+    proj = CkpProject(
+        variant="B", magic=b"\0\0\0\0", section_marker=0x0350,
+        prj_raw=b"", ini_raw=b"", nick_raw=b"", dview_raw=b"",
+        cmore_raw=b"", scr_raw=[], raw_zip_blobs=[],
+        subroutines=[
+            CkpSub(sub_id=1, name="Main", rungs=[]),
+            CkpSub(sub_id=2, name="Sub2", rungs=[]),
+            CkpSub(sub_id=3, name="Sub3", rungs=[]),
+        ],
+    )
+    program = ckp_to_il(proj)
+    names = [s.name for s in program.subroutines]
+    assert names == ["Main", "Sub2", "Sub3"]
+    assert all(s.kind is PouKind.PROGRAM for s in program.subroutines)
+    assert [s.main for s in program.subroutines] == [True, False, False]
+
+
+def test_ckp_to_il_translates_simple_ld_rung():
+    """Rung with contact + coil opcodes translates to IL ``Rung``
+    carrying ``ContactNO`` + ``OutCoil`` ops.  Headline op-mapping
+    smoke test."""
+    from click_plc.ckp_decoder import (
+        CkpProject, Instruction, Subroutine as CkpSub,
+    )
+    from click_plc.ckp_to_il import ckp_to_il
+    from universal_machinery.il.ops import ContactNO, OutCoil
+
+    proj = CkpProject(
+        variant="B", magic=b"\0\0\0\0", section_marker=0x0350,
+        prj_raw=b"", ini_raw=b"", nick_raw=b"", dview_raw=b"",
+        cmore_raw=b"", scr_raw=[], raw_zip_blobs=[],
+        subroutines=[
+            CkpSub(sub_id=1, name="Main", rungs=[
+                [
+                    Instruction(offset=0, opcode=0x11,
+                                  name="ContactNO", tag="X001"),
+                    Instruction(offset=20, opcode=0x15,
+                                  name="Out", tag="Y001"),
+                ],
+            ]),
+        ],
+    )
+    program = ckp_to_il(proj)
+    assert len(program.subroutines[0].rungs) == 1
+    ops = program.subroutines[0].rungs[0].ops
+    assert len(ops) == 2
+    assert isinstance(ops[0], ContactNO)
+    assert ops[0].address.raw == "X001"
+    assert isinstance(ops[1], OutCoil)
+    assert ops[1].address.raw == "Y001"
+
+
+def test_ckp_to_il_maps_all_supported_opcodes():
+    """One rung exercising every opcode the adapter recognises
+    -- pins each branch of the dispatch."""
+    from click_plc.ckp_decoder import (
+        CkpProject, Instruction, Subroutine as CkpSub,
+    )
+    from click_plc.ckp_to_il import ckp_to_il
+    from universal_machinery.il.ops import (
+        Call, ContactNC, ContactNO, End, Move, OutCoil, OutReset,
+        OutSet, Return,
+    )
+
+    proj = CkpProject(
+        variant="B", magic=b"\0\0\0\0", section_marker=0x0350,
+        prj_raw=b"", ini_raw=b"", nick_raw=b"", dview_raw=b"",
+        cmore_raw=b"", scr_raw=[], raw_zip_blobs=[],
+        subroutines=[
+            CkpSub(sub_id=1, name="Main", rungs=[
+                [
+                    Instruction(0, 0x11, "ContactNO", tag="X001"),
+                    Instruction(1, 0x12, "ContactNC", tag="X002"),
+                    Instruction(2, 0x15, "Out", tag="Y001"),
+                    Instruction(3, 0x16, "OutSet", tag="C1"),
+                    Instruction(4, 0x17, "OutReset", tag="C2"),
+                    Instruction(5, 0x21, "Copy", tag="DS10",
+                                  operands=["DS10", "DS20"]),
+                    Instruction(6, 0x23, "Call", tag="Sub2"),
+                    Instruction(7, 0x24, "Return"),
+                    Instruction(8, 0x27, "End"),
+                ],
+            ]),
+        ],
+    )
+    ops = ckp_to_il(proj).subroutines[0].rungs[0].ops
+    types = [type(op).__name__ for op in ops]
+    assert types == [
+        "ContactNO", "ContactNC", "OutCoil", "OutSet", "OutReset",
+        "Move", "Call", "Return", "End",
+    ]
+    move_op = ops[5]
+    assert isinstance(move_op, Move)
+    assert move_op.src.raw == "DS10"
+    assert move_op.dst.raw == "DS20"
+    assert isinstance(ops[6], Call)
+    assert ops[6].target == "Sub2"
+
+
+def test_ckp_to_il_skips_unhandled_opcodes_silently():
+    """Edge / Compare / Math / Tmr / For / Next aren't in this
+    slice's scope -- they're dropped from the rung silently rather
+    than raising.  The surrounding contacts + coil still survive."""
+    from click_plc.ckp_decoder import (
+        CkpProject, Instruction, Subroutine as CkpSub,
+    )
+    from click_plc.ckp_to_il import ckp_to_il
+    from universal_machinery.il.ops import ContactNO, OutCoil
+
+    proj = CkpProject(
+        variant="B", magic=b"\0\0\0\0", section_marker=0x0350,
+        prj_raw=b"", ini_raw=b"", nick_raw=b"", dview_raw=b"",
+        cmore_raw=b"", scr_raw=[], raw_zip_blobs=[],
+        subroutines=[
+            CkpSub(sub_id=1, name="Main", rungs=[
+                [
+                    Instruction(0, 0x11, "ContactNO", tag="X001"),
+                    Instruction(1, 0x13, "Edge", tag="X002"),
+                    Instruction(2, 0x14, "Compare",
+                                  operands=["DS10", "DS11"]),
+                    Instruction(3, 0x18, "Tmr", tag="T1"),
+                    Instruction(4, 0x1a, "Math",
+                                  operands=["DS10", "DS11", "DS12"]),
+                    Instruction(5, 0x15, "Out", tag="Y001"),
+                ],
+            ]),
+        ],
+    )
+    ops = ckp_to_il(proj).subroutines[0].rungs[0].ops
+    # Only the two simple ops survive.
+    assert len(ops) == 2
+    assert isinstance(ops[0], ContactNO)
+    assert isinstance(ops[1], OutCoil)
+
+
+def test_ckp_to_il_handles_subroutine_with_no_rungs():
+    """An empty subroutine (sub_id allocated but no ladder body)
+    maps to an empty IL ``Subroutine`` -- common pattern for
+    placeholder subs in CLICK projects."""
+    from click_plc.ckp_decoder import (
+        CkpProject, Subroutine as CkpSub,
+    )
+    from click_plc.ckp_to_il import ckp_to_il
+
+    proj = CkpProject(
+        variant="B", magic=b"\0\0\0\0", section_marker=0x0350,
+        prj_raw=b"", ini_raw=b"", nick_raw=b"", dview_raw=b"",
+        cmore_raw=b"", scr_raw=[], raw_zip_blobs=[],
+        subroutines=[CkpSub(sub_id=1, name="Empty", rungs=[])],
+    )
+    sub = ckp_to_il(proj).subroutines[0]
+    assert sub.name == "Empty"
+    assert sub.rungs == []
